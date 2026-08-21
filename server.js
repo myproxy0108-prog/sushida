@@ -28,7 +28,7 @@ app.use((req, res, next) => {
 });
 
 // ==========================================
-// 2. 寿司打 ドメイン偽装インジェクション
+// 2. 寿司打 偽装プロキシ
 // ==========================================
 const TARGET_HOST = "sushida.net";
 const TARGET_ORIGIN = `https://${TARGET_HOST}`;
@@ -45,35 +45,30 @@ const SPOOF_SCRIPT = `
 </script>
 `;
 
-// トップアクセスは直接ゲーム画面へ
+// ルートアクセス時は直接ゲーム画面へリダイレクト
 app.get('/', (req, res) => {
     res.redirect('/play.html');
 });
 
-// ==========================================
-// 3. 高精度リバースプロキシ転送
-// ==========================================
+// ★ ボディパーサーは挟まず、ストリームを直接中継してハングアップを防止
 app.all('*', (req, res) => {
     if (req.url === '/favicon.ico') return res.status(204).end();
 
     const currentHost = req.get('host');
     const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
 
-    // 寿司打が要求する厳密なリクエストヘッダーを作成
+    // 寿司打本家向けの完全偽装リクエストヘッダー
     const outgoingHeaders = {
         ...req.headers,
         'host': TARGET_HOST,
         'origin': TARGET_ORIGIN,
         'referer': `${TARGET_ORIGIN}/play.html`,
-        'sec-fetch-dest': req.headers['sec-fetch-dest'] || 'empty',
-        'sec-fetch-mode': req.headers['sec-fetch-mode'] || 'cors',
-        'sec-fetch-site': 'same-origin'
     };
     delete outgoingHeaders['connection'];
 
-    // HTMLリクエスト時のみ置換を行うため非圧縮を要求
-    const isHtmlRequest = req.path.endsWith('.html') || (!req.path.includes('.') && req.headers['accept']?.includes('text/html'));
-    if (isHtmlRequest) {
+    // HTMLのみ置換のため非圧縮で要求
+    const isHtml = req.path === '/' || req.path.endsWith('.html') || (req.headers['accept'] && req.headers['accept'].includes('text/html') && !req.path.includes('.'));
+    if (isHtml) {
         outgoingHeaders['accept-encoding'] = 'identity';
     }
 
@@ -89,41 +84,29 @@ app.all('*', (req, res) => {
     const proxyReq = https.request(options, (proxyRes) => {
         let headers = { ...proxyRes.headers };
 
-        // 制限ヘッダーを解除
+        // 埋め込み制限・セキュリティヘッダーを解除
         delete headers['content-security-policy'];
         delete headers['x-frame-options'];
         delete headers['strict-transport-security'];
 
-        // CORS対応
+        // CORSを全開放（アセットの読み込みブロック対策）
         headers['access-control-allow-origin'] = '*';
         headers['access-control-allow-methods'] = 'GET, POST, OPTIONS, HEAD';
         headers['access-control-allow-headers'] = '*';
 
-        // MIMEタイプの補正（Unity WebGL用）
-        if (req.path.endsWith('.wasm') || req.path.endsWith('.wasm.unityweb')) {
-            headers['content-type'] = 'application/wasm';
-        } else if (req.path.endsWith('.data') || req.path.endsWith('.data.unityweb')) {
-            headers['content-type'] = 'application/octet-stream';
-        } else if (req.path.endsWith('.js') || req.path.endsWith('.js.unityweb')) {
-            headers['content-type'] = 'application/javascript';
-        } else if (req.path.endsWith('.json') || req.path.endsWith('.json.unityweb')) {
-            headers['content-type'] = 'application/json';
-        }
+        const contentType = proxyRes.headers['content-type'] || '';
 
-        const contentType = headers['content-type'] || '';
-
-        // ★ HTMLの場合：偽装スクリプトを注入＆リンク置換
-        if (contentType.includes('text/html')) {
+        // ★ HTMLファイルの場合のみ：リンク書き換えと偽装スクリプトを注入
+        if (isHtml && contentType.includes('text/html')) {
             let body = '';
             proxyRes.setEncoding('utf-8');
-            proxyRes.on('data', chunk => body += chunk);
+            proxyRes.on('data', chunk => { body += chunk; });
             proxyRes.on('end', () => {
-                // 本家URLを現在のプロキシURLに置換
+                // 本家のURLを自ホストに書き換え
                 body = body.replace(new RegExp(`https?:\/\/${TARGET_HOST}`, 'gi'), `${protocol}://${currentHost}`);
                 body = body.replace(/http:\/\/typingx0\.net\/sushida/gi, `${protocol}://${currentHost}`);
                 body = body.replace(new RegExp(`\/\/${TARGET_HOST}`, 'g'), `//${currentHost}`);
 
-                // 先頭に偽装スクリプトを挿入
                 if (body.includes('<head>')) {
                     body = body.replace('<head>', '<head>' + SPOOF_SCRIPT);
                 } else {
@@ -137,17 +120,23 @@ app.all('*', (req, res) => {
             return;
         }
 
-        // ★ ゲーム本体（WebGLバイナリ・音声・画像等）は1バイトも劣化させずパイプ転送
+        // ★ Unity WebGLゲーム本体（.unityweb, .wasm, .data, .js, 音声, 画像等）
+        // 寿司打が返したオリジナルのContent-Type・Content-Encodingのままブラウザに直接ストリーム転送
         res.writeHead(proxyRes.statusCode, headers);
         proxyRes.pipe(res);
     });
 
-    proxyReq.on('error', (err) => {
+    proxyReq.on('error', () => {
         if (!res.headersSent) res.status(502).send('Proxy Connection Error');
     });
 
-    req.pipe(proxyReq);
+    // GET / HEAD は即座にリクエストを確定（通信詰まり・ハングアップの解消）
+    if (req.method === 'GET' || req.method === 'HEAD') {
+        proxyReq.end();
+    } else {
+        req.pipe(proxyReq);
+    }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Sushida Full-Spoof Proxy Engine Online on port ${PORT}`));
+app.listen(PORT, () => console.log(`Sushida Fixed Engine Online on port ${PORT}`));
